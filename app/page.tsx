@@ -14,7 +14,7 @@ import { PRICING_PLANS } from "@/lib/constants";
 import {
   BlueTitle,
   GrayTitle,
-  SectionHeading,
+  SectionHeading,                                              
   SectionLabel,
 } from "@/components/reusables";
 
