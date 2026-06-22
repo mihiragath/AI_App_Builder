@@ -149,7 +149,7 @@ RULES:
           done_improving: { autoApprove: true },
         },
       });
-
+      
       try {
         // ── Stream agent reasoning to chat panel ─────────────────────────
         // assistant-text-delta fires as the agent types its reasoning.
