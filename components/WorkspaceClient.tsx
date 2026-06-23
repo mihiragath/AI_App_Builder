@@ -14,6 +14,17 @@ import type {
   WorkspaceData,
 } from "@/types/workspace";
 
+type SseEvent = { type: string; [key: string]: unknown };
+
+function parseSseEvent(line: string): SseEvent | null {
+  if (!line.startsWith("data: ")) return null;
+  try {
+    return JSON.parse(line.slice(6)) as SseEvent;
+  } catch {
+    return null;
+  }
+}
+
 export type {
   MessageRole,
   Message,
@@ -165,30 +176,30 @@ export function WorkspaceClient({
           buffer = lines.pop() ?? "";
 
           for (const line of lines) {
-            if (!line.startsWith("data: ")) continue;
-            try {
-              const event = JSON.parse(line.slice(6));
-              if (event.type === "status") {
-                pushStep(event.message);
-              } else if (event.type === "done") {
-                completeSteps();
-                setWorkspaceId(event.workspaceId);
-                setFileData(event.fileData);
-                setCredits(event.creditsRemaining);
-                setMessages((prev) => [
-                  ...prev,
-                  { role: "assistant", content: event.assistantMessage },
-                ]);
-                window.history.replaceState(
-                  null,
-                  "",
-                  `/workspace?id=${event.workspaceId}`
-                );
-              } else if (event.type === "error") {
-                throw new Error(event.message);
-              }
-            } catch {
-              // skip malformed SSE lines
+            const event = parseSseEvent(line);
+            if (!event) continue;
+
+            if (event.type === "status") {
+              pushStep(event.message as string);
+            } else if (event.type === "done") {
+              completeSteps();
+              setWorkspaceId(event.workspaceId as string);
+              setFileData(event.fileData as FileData);
+              setCredits(event.creditsRemaining as number);
+              setMessages((prev) => [
+                ...prev,
+                {
+                  role: "assistant",
+                  content: event.assistantMessage as string,
+                },
+              ]);
+              window.history.replaceState(
+                null,
+                "",
+                `/workspace?id=${event.workspaceId}`
+              );
+            } else if (event.type === "error") {
+              throw new Error(event.message as string);
             }
           }
         }
@@ -282,42 +293,36 @@ export function WorkspaceClient({
           buffer = lines.pop() ?? "";
 
           for (const line of lines) {
-            if (!line.startsWith("data: ")) continue;
-            try {
-              const event = JSON.parse(line.slice(6));
+            const event = parseSseEvent(line);
+            if (!event) continue;
 
-              if (event.type === "thinking") {
-                // Stream agent reasoning into the placeholder assistant message
-                accumulatedThinking += event.text;
-                setMessages((prev) => {
-                  const updated = [...prev];
-                  updated[updated.length - 1] = {
-                    role: "assistant",
-                    content: accumulatedThinking,
-                  };
-                  return updated;
-                });
-              } else if (event.type === "file_patch") {
-                // Accumulate locally — don't touch state yet
-                localPatches[event.path] = { code: event.code };
-              } else if (event.type === "done") {
-                // Apply all patches at once now that the stream is complete
-                setFileData(event.fileData);
-                setCredits(event.creditsRemaining);
-                // Replace thinking text with clean summary
-                setMessages((prev) => {
-                  const updated = [...prev];
-                  updated[updated.length - 1] = {
-                    role: "assistant",
-                    content: event.summary,
-                  };
-                  return updated;
-                });
-              } else if (event.type === "error") {
-                throw new Error(event.message);
-              }
-            } catch {
-              // skip malformed SSE lines
+            if (event.type === "thinking") {
+              accumulatedThinking += event.text as string;
+              setMessages((prev) => {
+                const updated = [...prev];
+                updated[updated.length - 1] = {
+                  role: "assistant",
+                  content: accumulatedThinking,
+                };
+                return updated;
+              });
+            } else if (event.type === "file_patch") {
+              localPatches[event.path as string] = {
+                code: event.code as string,
+              };
+            } else if (event.type === "done") {
+              setFileData(event.fileData as FileData);
+              setCredits(event.creditsRemaining as number);
+              setMessages((prev) => {
+                const updated = [...prev];
+                updated[updated.length - 1] = {
+                  role: "assistant",
+                  content: event.summary as string,
+                };
+                return updated;
+              });
+            } else if (event.type === "error") {
+              throw new Error(event.message as string);
             }
           }
         }

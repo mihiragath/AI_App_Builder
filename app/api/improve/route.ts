@@ -1,18 +1,39 @@
 import { auth } from "@clerk/nextjs/server";
 import { NextRequest } from "next/server";
-import { Agent, createTool } from "@cline/sdk";
-import { z } from "zod";
 import { db } from "@/lib/prisma";
 import { CREDIT_COST_PER_GENERATION } from "@/lib/constants";
+import {
+  extractThoughtLabel,
+  formatGeminiError,
+  generateContentStreamWithFallback,
+} from "@/lib/gemini";
 import type { FileData } from "@/types/workspace";
-
-// ─── SSE helper ───────────────────────────────────────────────────────────────
 
 function sseEvent(type: string, payload: object): string {
   return `data: ${JSON.stringify({ type, ...payload })}\n\n`;
 }
 
-// ─── Route ────────────────────────────────────────────────────────────────────
+const IMPROVE_SYSTEM_PROMPT = `You are an expert React developer improving a live browser preview app.
+
+The app uses React (functional components), Tailwind CSS for styling, and runs in Sandpack.
+You CANNOT use TypeScript, CSS modules, or real npm install — only what's already available.
+Available packages: react, react-dom, tailwindcss (CDN), lucide-react, recharts, react-router-dom, framer-motion, date-fns, zod, react-hook-form.
+
+Always respond with a valid JSON object — no markdown fences, no extra text.
+The JSON must match this exact shape:
+{
+  "summary": "<1-3 sentence friendly summary of all improvements>",
+  "files": {
+    "/App.js": { "code": "<complete new file content>" }
+  }
+}
+
+RULES:
+- Only include files you actually changed in "files".
+- Always write complete file contents — never partial snippets or diffs.
+- Keep all existing functionality unless asked to remove it.
+- The entry point is always /App.js with a default export.
+- All imports must reference files in the project or packages in the available list above.`;
 
 export async function POST(request: NextRequest) {
   const { userId: clerkId } = await auth();
@@ -23,11 +44,9 @@ export async function POST(request: NextRequest) {
   const { userId, workspaceId, userRequest, fileData } = body as {
     userId: string;
     workspaceId: string;
-    userRequest: string; // what the user wants improved
+    userRequest: string;
     fileData: FileData;
   };
-
-  // ── Auth + credit check ────────────────────────────────────────────────────
 
   const user = await db.user.findUnique({
     where: { id: userId, clerkId },
@@ -37,14 +56,11 @@ export async function POST(request: NextRequest) {
   if (!user)
     return Response.json({ message: "User not found" }, { status: 404 });
 
-  // Pro-only gate
   if (user.plan !== "pro")
     return Response.json({ message: "Upgrade required" }, { status: 403 });
 
   if (user.credits < CREDIT_COST_PER_GENERATION)
     return Response.json({ message: "Insufficient credits" }, { status: 402 });
-
-  // ── Build the agent ────────────────────────────────────────────────────────
 
   const encoder = new TextEncoder();
 
@@ -53,141 +69,101 @@ export async function POST(request: NextRequest) {
       const enqueue = (chunk: string) =>
         controller.enqueue(encoder.encode(chunk));
 
-      // Accumulate file patches as the agent calls update_file
-      const patchedFiles: Record<string, { code: string }> = {
-        ...fileData.files,
-      };
-      let finalSummary = "";
-
-      // ── Tool 1: update_file ──────────────────────────────────────────────
-      // The agent calls this once per file it wants to change.
-      // We immediately emit a file_patch SSE event so Sandpack
-      // updates live in the browser as each file is patched.
-
-      const updateFileTool = createTool({
-        name: "update_file",
-        description:
-          "Update or rewrite a file in the React sandbox. Call once per file you need to change.",
-        inputSchema: z.object({
-          path: z
-            .string()
-            .describe("File path exactly as it appears, e.g. /App.js"),
-          code: z.string().describe("Complete new contents of the file"),
-          reason: z
-            .string()
-            .describe("One sentence explaining what you changed and why"),
-        }),
-        async execute({ path, code, reason }) {
-          patchedFiles[path] = { code };
-          // Emit live patch — client applies it to Sandpack immediately
-          enqueue(sseEvent("file_patch", { path, code, reason }));
-          return `Updated ${path}: ${reason}`;
-        },
-      });
-
-      // ── Tool 2: done_improving ───────────────────────────────────────────
-      // Agent calls this when all files are updated.
-      // lifecycle.completesRun: true tells the Cline SDK loop to stop
-      // immediately after this tool runs instead of continuing iterations.
-
-      const doneImprovingTool = createTool({
-        name: "done_improving",
-        description:
-          "Call this when you have finished making all improvements.",
-        inputSchema: z.object({
-          summary: z
-            .string()
-            .describe(
-              "A short friendly summary of all the improvements you made (1-3 sentences)"
-            ),
-        }),
-        lifecycle: { completesRun: true },
-        async execute({ summary }) {
-          finalSummary = summary;
-          return "Done.";
-        },
-      });
-
-      // ── Serialize current files for context ──────────────────────────────
-      // We give the agent all current files as context in the system prompt
-      // so it knows exactly what it's working with.
-
-      const fileContext = Object.entries(fileData.files)
-        .map(([path, { code }]) => `// ${path}\n${code}`)
-        .join("\n\n---\n\n");
-
-      const agent = new Agent({
-        providerId: "gemini",
-        modelId: "gemini-3.5-flash",
-        apiKey: process.env.GEMINI_API_KEY!,
-        maxIterations: 8,
-        systemPrompt: `You are an expert React developer improving a live browser preview app.
-
-The app uses React (functional components), Tailwind CSS for styling, and runs in Sandpack.
-You CANNOT use TypeScript, CSS modules, or real npm install — only what's already available.
-Available packages: react, react-dom, tailwindcss (CDN), lucide-react, recharts, react-router-dom, framer-motion, date-fns, zod, react-hook-form.
-
-Here are the current files:
-
-${fileContext}
-
-WORKFLOW:
-1. Understand what the user wants improved.
-2. Identify which files need to change.
-3. Call update_file for each file that needs changes (always include the COMPLETE file, not just the diff).
-4. Once all files are updated, call done_improving with a short summary.
-
-RULES:
-- Always write complete file contents — never partial snippets.
-- Keep all existing functionality unless asked to remove it.
-- The entry point is always /App.js with a default export.
-- All imports must reference files you've updated or packages in the available list above.`,
-        tools: [updateFileTool, doneImprovingTool],
-        // Auto-approve both tools — no human-in-the-loop needed in this context
-        toolPolicies: {
-          update_file: { autoApprove: true },
-          done_improving: { autoApprove: true },
-        },
-      });
-      
       try {
-        // ── Stream agent reasoning to chat panel ─────────────────────────
-        // assistant-text-delta fires as the agent types its reasoning.
-        // We emit these as "thinking" events — shown in the chat panel
-        // as a live streaming message so users see the agent working.
+        enqueue(sseEvent("status", { message: "Analyzing your request…" }));
 
-        agent.subscribe((event) => {
-          if (event.type === "assistant-text-delta" && event.text) {
-            enqueue(sseEvent("thinking", { text: event.text }));
-          }
+        const fileContext = Object.entries(fileData.files)
+          .map(([path, { code }]) => `// ${path}\n${code}`)
+          .join("\n\n---\n\n");
 
-          // This fires reliably every time a tool is called
-          if (event.type === "tool-started") {
-            const name = event.toolCall?.toolName;
-            if (name === "update_file") {
-              const path =
-                (event.toolCall?.input as { path?: string })?.path ?? "a file";
-              enqueue(
-                sseEvent("thinking", { text: `\n\nUpdating \`${path}\`…` })
-              );
-            } else if (name === "done_improving") {
-              enqueue(
-                sseEvent("thinking", { text: "\n\nFinalizing improvements…" })
-              );
-            }
-          }
+        const geminiStream = await generateContentStreamWithFallback({
+          contents: [
+            {
+              role: "user",
+              parts: [
+                {
+                  text: `Improvement request: ${userRequest}
+
+Current files:
+
+${fileContext}`,
+                },
+              ],
+            },
+          ],
+          config: {
+            systemInstruction: IMPROVE_SYSTEM_PROMPT,
+            temperature: 0.5,
+            responseMimeType: "application/json",
+            thinkingConfig: { includeThoughts: true },
+          },
         });
 
-        // ── Run the agent ─────────────────────────────────────────────────
-        enqueue(sseEvent("status", { message: "Cline agent starting…" }));
+        let accumulated = "";
+        let lastEmitTime = 0;
 
-        const result = await agent.run(userRequest);
+        for await (const chunk of geminiStream) {
+          const parts = chunk.candidates?.[0]?.content?.parts ?? [];
 
-        if (result.status === "failed") {
-          throw new Error(result.error?.message ?? "Agent run failed");
+          for (const part of parts) {
+            if (!part.text) continue;
+
+            if (part.thought) {
+              const now = Date.now();
+              if (now - lastEmitTime > 600) {
+                const label = extractThoughtLabel(part.text);
+                if (label) {
+                  enqueue(sseEvent("thinking", { text: `${label}\n` }));
+                  lastEmitTime = now;
+                }
+              }
+            } else {
+              accumulated += part.text;
+            }
+          }
         }
 
-        // ── Deduct credit + save to DB ────────────────────────────────────
+        let parsed: {
+          summary: string;
+          files: Record<string, { code: string }>;
+        };
+
+        try {
+          parsed = JSON.parse(accumulated);
+        } catch {
+          enqueue(
+            sseEvent("error", {
+              message: "AI returned invalid JSON. Please try again.",
+            })
+          );
+          return;
+        }
+
+        const { summary, files: changedFiles } = parsed;
+
+        if (!changedFiles || typeof changedFiles !== "object") {
+          enqueue(
+            sseEvent("error", {
+              message: "AI response missing file updates. Please try again.",
+            })
+          );
+          return;
+        }
+
+        const patchedFiles: Record<string, { code: string }> = {
+          ...fileData.files,
+        };
+
+        for (const [path, { code }] of Object.entries(changedFiles)) {
+          patchedFiles[path] = { code };
+          enqueue(
+            sseEvent("file_patch", {
+              path,
+              code,
+              reason: "Updated based on your request",
+            })
+          );
+        }
 
         const newFileData: FileData = {
           files: patchedFiles,
@@ -211,12 +187,10 @@ RULES:
           select: { credits: true },
         });
 
-        // ── Final done event ──────────────────────────────────────────────
-
         enqueue(
           sseEvent("done", {
             fileData: newFileData,
-            summary: finalSummary || result.outputText,
+            summary: summary || "Improvements applied.",
             creditsRemaining:
               updatedUser?.credits ?? user.credits - CREDIT_COST_PER_GENERATION,
           })
@@ -225,8 +199,7 @@ RULES:
         console.error("[improve] error:", err);
         enqueue(
           sseEvent("error", {
-            message:
-              err instanceof Error ? err.message : "Something went wrong.",
+            message: formatGeminiError(err),
           })
         );
       } finally {
@@ -245,4 +218,4 @@ RULES:
 }
 
 export const runtime = "nodejs";
-export const maxDuration = 300; // for vercel - 300s on Fluid
+export const maxDuration = 300;
